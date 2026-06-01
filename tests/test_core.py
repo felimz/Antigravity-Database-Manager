@@ -651,5 +651,78 @@ class TestWidgetTrunc(unittest.TestCase):
         self.assertIn("…", result)
 
 
+# ==============================================================================
+# TEST: WORKSPACE ASSIGNMENT
+# ==============================================================================
+
+class TestWorkspaceAssignment(unittest.TestCase):
+    """Tests for the dynamic workspace assignment logic."""
+
+    def test_find_matching_workspace_none(self):
+        from src.core.db_operations import find_matching_workspace
+        self.assertIsNone(find_matching_workspace(None))
+        self.assertIsNone(find_matching_workspace(""))
+
+    def test_find_matching_workspace_semantic_mappings(self):
+        from src.core.db_operations import find_matching_workspace
+        import unittest.mock as mock
+        def mock_isdir(p):
+            p_clean = p.replace("\\", "/").rstrip("/").lower()
+            return p_clean in [
+                "c:/users/felim/antigravityprojects/playground",
+                "c:/users/felim/antigravityprojects/hermes",
+                "c:/users/felim/antigravityprojects/moduledesigncriteria",
+            ]
+        with mock.patch("os.path.isdir", side_effect=mock_isdir), mock.patch("os.path.expanduser", return_value="C:\\Users\\felim"):
+            ws = find_matching_workspace("Let's discuss cell mitosis and cell division")
+            self.assertEqual(ws.replace("\\", "/").lower(), "c:/users/felim/antigravityprojects/playground")
+
+            ws2 = find_matching_workspace("Nous portal updates")
+            self.assertEqual(ws2.replace("\\", "/").lower(), "c:/users/felim/antigravityprojects/hermes")
+
+    def test_find_matching_workspace_generic_folder(self):
+        from src.core.db_operations import find_matching_workspace
+        import unittest.mock as mock
+        def mock_isdir(p):
+            p_clean = p.replace("\\", "/").rstrip("/").lower()
+            return p_clean in [
+                "c:/users/felim/antigravityprojects/playground",
+                "c:/users/felim/antigravityprojects/hermes",
+                "c:/users/felim/antigravityprojects/moduledesigncriteria",
+            ]
+        with mock.patch("os.path.isdir", side_effect=mock_isdir), mock.patch("os.path.expanduser", return_value="C:\\Users\\felim"):
+            ws = find_matching_workspace("We need to debug the moduledesigncriteria repo")
+            self.assertEqual(ws.replace("\\", "/").lower(), "c:/users/felim/antigravityprojects/moduledesigncriteria")
+
+    def test_find_matching_workspace_uri_direct(self):
+        from src.core.db_operations import find_matching_workspace
+        import unittest.mock as mock
+        def mock_isdir(p):
+            p_clean = p.replace("\\", "/").rstrip("/").lower()
+            return p_clean in [
+                "c:/users/felim/antigravityprojects/playground",
+                "c:/users/felim/antigravityprojects/hermes",
+                "c:/users/felim/antigravityprojects/moduledesigncriteria",
+            ]
+        with mock.patch("os.path.isdir", side_effect=mock_isdir), mock.patch("os.path.expanduser", return_value="C:\\Users\\felim"):
+            ws = find_matching_workspace("Open workspace file:///c%3A/Users/felim/AntigravityProjects/hermes/some/subdir")
+            self.assertEqual(ws.replace("\\", "/").lower(), "c:/users/felim/antigravityprojects/hermes")
+
+    def test_find_matching_workspace_rejections(self):
+        from src.core.db_operations import find_matching_workspace
+        import unittest.mock as mock
+        def mock_isdir(p):
+            p_clean = p.replace("\\", "/").rstrip("/").lower()
+            return p_clean in [
+                "c:/users/felim/antigravityprojects/playground",
+                "c:/users/felim/antigravityprojects/hermes",
+                "c:/users/felim/antigravityprojects/moduledesigncriteria",
+            ]
+        with mock.patch("os.path.isdir", side_effect=mock_isdir), mock.patch("os.path.expanduser", return_value="C:\\Users\\felim"):
+            # If path points to base directory directly, it should be rejected to prevent matching base
+            ws = find_matching_workspace("Open workspace file:///c%3A/Users/felim/AntigravityProjects")
+            self.assertIsNone(ws)
+
+
 if __name__ == "__main__":
     unittest.main()

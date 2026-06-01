@@ -191,13 +191,34 @@ class ProtobufEncoder:
                     l, pos = cls.decode_varint(inner_blob, pos)
                     content = inner_blob[pos:pos + l]
                     pos += l
-                    if field_num > 1:
-                        try:
-                            text = content.decode("utf-8", errors="strict")
-                            if "file:///" in text:
-                                return text
-                        except Exception:
-                            pass
+                    # Check nested sub-messages that carry workspace settings
+                    if field_num == 17 or field_num == 9:
+                        sub_pos = 0
+                        while sub_pos < len(content):
+                            try:
+                                sub_tag, sub_pos = cls.decode_varint(content, sub_pos)
+                                sub_fn = sub_tag >> 3
+                                sub_wt = sub_tag & 7
+                                if sub_wt == 2:
+                                    # Length-delimited sub-field (e.g. URI string)
+                                    sub_len, sub_pos = cls.decode_varint(content, sub_pos)
+                                    sub_content = content[sub_pos:sub_pos+sub_len]
+                                    sub_pos += sub_len
+                                    # Field 17 Sub-field 7 (URI encoded)
+                                    if field_num == 17 and sub_fn == 7:
+                                        text = sub_content.decode('utf-8', errors='ignore')
+                                        if "file:///" in text:
+                                            return text
+                                    # Field 9 Sub-field 1 (URI encoded)
+                                    elif field_num == 9 and sub_fn == 1:
+                                        text = sub_content.decode('utf-8', errors='ignore')
+                                        if "file:///" in text:
+                                            return text
+                                else:
+                                    # Skip other wire-type nested fields safely
+                                    sub_pos = cls.skip_protobuf_field(content, sub_pos, sub_wt)
+                            except Exception:
+                                break
                 elif wire_type == 0:
                     _, pos = cls.decode_varint(inner_blob, pos)
                 elif wire_type == 1:

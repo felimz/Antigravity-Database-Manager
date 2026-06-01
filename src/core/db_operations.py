@@ -273,9 +273,15 @@ def execute_merge(source_path: str, target_path: str,
             else:
                 skipped += 1
 
-        # 5. Rebuild PB blob
+        # 5. Rebuild PB blob (sorted by lastModified descending)
+        sorted_cids = sorted(
+            merged_blobs.keys(),
+            key=lambda k: merged_json_entries.get(k, {}).get("lastModified", 0),
+            reverse=True,
+        )
         result_bytes = b""
-        for cid, blob in merged_blobs.items():
+        for cid in sorted_cids:
+            blob = merged_blobs[cid]
             title = merged_titles.get(cid, f"Conversation {cid[:8]}")
             entry = ProtobufEncoder.build_trajectory_entry(
                 cid, title, None, int(time.time()), int(time.time()),
@@ -292,7 +298,16 @@ def execute_merge(source_path: str, target_path: str,
         else:
             tgt_cur.execute("INSERT INTO ItemTable (key, value) VALUES (?, ?)", (PB_KEY, encoded_pb))
 
-        merged_json = {"version": 1, "entries": merged_json_entries}
+        # Sort merged entries by lastModified descending before serializing
+        sorted_merged_entries = {}
+        sorted_keys = sorted(
+            merged_json_entries.keys(),
+            key=lambda k: merged_json_entries[k].get("lastModified", 0),
+            reverse=True
+        )
+        for k in sorted_keys:
+            sorted_merged_entries[k] = merged_json_entries[k]
+        merged_json = {"version": 1, "entries": sorted_merged_entries}
         tgt_cur.execute(
             "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
             (JSON_KEY, json.dumps(merged_json, ensure_ascii=False)),
@@ -389,8 +404,18 @@ def execute_selective_merge(source_path: str, target_path: str,
             else:
                 skipped += 1
 
+        # Sort merged entries by lastModified descending before serializing
+        sorted_keys = sorted(
+            merged_json_entries.keys(),
+            key=lambda k: merged_json_entries[k].get("lastModified", 0),
+            reverse=True
+        )
+
         result_bytes = b""
-        for cid, blob in merged_blobs.items():
+        for cid in sorted_keys:
+            if cid not in merged_blobs:
+                continue
+            blob = merged_blobs[cid]
             title = merged_titles.get(cid, f"Conversation {cid[:8]}")
             entry = ProtobufEncoder.build_trajectory_entry(
                 cid, title, None, int(time.time()), int(time.time()),
@@ -406,7 +431,8 @@ def execute_selective_merge(source_path: str, target_path: str,
         else:
             tgt_cur.execute("INSERT INTO ItemTable (key, value) VALUES (?, ?)", (PB_KEY, encoded_pb))
 
-        merged_json = {"version": 1, "entries": merged_json_entries}
+        sorted_merged_entries = {k: merged_json_entries[k] for k in sorted_keys}
+        merged_json = {"version": 1, "entries": sorted_merged_entries}
         tgt_cur.execute(
             "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
             (JSON_KEY, json.dumps(merged_json, ensure_ascii=False)),
@@ -428,6 +454,108 @@ def execute_selective_merge(source_path: str, target_path: str,
 
 
 # ==============================================================================
+# DATABASE METADATA EXTRACTIONS FOR NEW FORMAT
+# ==============================================================================
+
+def extract_workspace_from_db(db_file_path: str) -> str:
+    """Extracts file:/// workspace URI from the trajectory_metadata_blob table."""
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_file_path}?mode=ro", uri=True)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trajectory_metadata_blob';")
+        if not cur.fetchone():
+            return ""
+        cur.execute("SELECT data FROM trajectory_metadata_blob WHERE id = 'main';")
+        row = cur.fetchone()
+        if row and row[0]:
+            blob = row[0]
+            idx = blob.find(b"file:///")
+            if idx != -1:
+                sub = blob[idx:]
+                for i in range(len(sub)):
+                    if sub[i] < 32 or sub[i] > 126:
+                        sub = sub[:i]
+                        break
+                import re
+                uri = sub.decode('utf-8', errors='ignore')
+                return re.sub(
+                    r'^(file:///)(\w)(%3A|:)',
+                    lambda m: m.group(1) + m.group(2).lower() + m.group(3),
+                    uri,
+                    flags=re.IGNORECASE,
+                )
+    except Exception:
+        pass
+    finally:
+        if conn:
+            conn.close()
+    return ""
+
+
+def extract_title_from_db(db_file_path: str) -> str | None:
+    """Extracts first user prompt from steps table to use as title."""
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_file_path}?mode=ro", uri=True)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='steps';")
+        if not cur.fetchone():
+            return None
+        cur.execute("SELECT step_payload FROM steps WHERE idx = 0;")
+        row = cur.fetchone()
+        if row and row[0]:
+            payload = row[0]
+            text = payload.decode('utf-8', errors='ignore')
+            import re
+            segments = re.findall(r'[a-zA-Z0-9_/\.:%\-+@[\] ]{20,}', text)
+            for seg in segments:
+                seg = seg.strip()
+                if "file:///" in seg:
+                    continue
+                if re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', seg):
+                    continue
+                if len(seg) > 20:
+                    seg = re.sub(r'^[^a-zA-Z0-9]+', '', seg)
+                    if len(seg) > 50:
+                        return seg[:47] + "..."
+                    return seg
+    except Exception:
+        pass
+    finally:
+        if conn:
+            conn.close()
+    return None
+
+
+def extract_workspace_from_db_steps(db_file_path: str) -> str:
+    """Extracts step payloads from database steps table, concatenated."""
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_file_path}?mode=ro", uri=True)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='steps';")
+        if not cur.fetchone():
+            return ""
+        cur.execute("SELECT step_payload FROM steps ORDER BY idx ASC;")
+        rows = cur.fetchall()
+        payloads = []
+        for row in rows:
+            val = row[0]
+            if val:
+                if isinstance(val, bytes):
+                    payloads.append(val.decode('utf-8', errors='ignore'))
+                else:
+                    payloads.append(str(val))
+        return "\n".join(payloads)
+    except Exception:
+        return ""
+    finally:
+        if conn:
+            conn.close()
+
+
+# ==============================================================================
 # TITLE RESOLUTION
 # ==============================================================================
 
@@ -436,21 +564,30 @@ def resolve_title(cid: str, existing_titles: dict[str, str],
     """
     Determines the best title for a conversation.
 
-    Priority: brain artifact > preserved DB title > timestamp fallback.
+    Priority: brain artifact > preserved DB title > db prompt > timestamp fallback.
 
     Returns:
-        (title, source_label) where source_label is 'brain', 'preserved', or 'fallback'.
+        (title, source_label) where source_label is 'brain', 'preserved', 'db', or 'fallback'.
     """
     brain_title = ArtifactParser.extract_title(cid, brain_dir)
     if brain_title:
         return brain_title, "brain"
 
     if cid in existing_titles:
-        return existing_titles[cid], "preserved"
+        title = existing_titles[cid].strip()
+        if not (title.startswith("{") or title.startswith("Conversation (") or title.startswith("Conversation ")):
+            return title, "preserved"
+
+    db_path = os.path.join(convs_dir, f"{cid}.db")
+    if os.path.exists(db_path):
+        db_title = extract_title_from_db(db_path)
+        if db_title:
+            return db_title, "db"
 
     pb_path = os.path.join(convs_dir, f"{cid}.pb")
-    if os.path.exists(pb_path):
-        mod_time = time.strftime("%b %d", time.localtime(os.path.getmtime(pb_path)))
+    active_path = pb_path if os.path.exists(pb_path) else db_path
+    if os.path.exists(active_path):
+        mod_time = time.strftime("%b %d", time.localtime(os.path.getmtime(active_path)))
         return f"Conversation ({mod_time}) {cid[:8]}", "fallback"
 
     return f"Conversation {cid[:8]}", "fallback"
@@ -469,6 +606,178 @@ def _safe_rollback(backup_path: str, target_path: str) -> None:
         shutil.copy2(backup_path, target_path)
     except Exception:
         pass
+
+
+def find_matching_workspace(hint_or_blob) -> str | None:
+    if not hint_or_blob:
+        return None
+    import urllib.parse
+    import re
+    
+    if isinstance(hint_or_blob, bytes):
+        try:
+            text = hint_or_blob.decode('utf-8', errors='ignore')
+        except Exception:
+            return None
+    else:
+        text = str(hint_or_blob)
+        
+    home = os.path.expanduser("~").replace("\\", "/").rstrip("/")
+    home_lower = home.lower()
+        
+    def get_workspace_base(path: str) -> str | None:
+        path_clean = path.replace("\\", "/").rstrip("/")
+        bases = [
+            f"{home_lower}/antigravityprojects",
+            f"{home_lower}/documents/antigravity"
+        ]
+        for base in bases:
+            path_lower = path_clean.lower()
+            if path_lower.startswith(base):
+                rel = path_lower[len(base):].lstrip("/")
+                parts = rel.split("/")
+                if parts and parts[0]:
+                    project_name = parts[0]
+                    prefix_len = len(base) + 1 + len(project_name)
+                    return path[:prefix_len]
+        return None
+
+    def validate_dir(path: str) -> str | None:
+        ws_base = get_workspace_base(path)
+        if not ws_base:
+            return None
+        if os.path.isdir(ws_base):
+            return ws_base
+        return None
+
+    # Get local workspaces map
+    ws_paths = {}
+    fallbacks = {
+        "moduledesigncriteria": f"{home}/AntigravityProjects/moduledesigncriteria",
+        "conversationtest": f"{home}/AntigravityProjects/conversationtest",
+        "playground": f"{home}/AntigravityProjects/playground",
+        "hermes": f"{home}/AntigravityProjects/hermes",
+        "glassworm_scanner": f"{home}/AntigravityProjects/glassworm_scanner",
+        "glassworm_hunter": f"{home}/AntigravityProjects/glassworm_hunter",
+    }
+    for name, path in fallbacks.items():
+        ws_paths[name.lower()] = path
+        
+    bases = [
+        os.path.join(os.path.expanduser("~"), "AntigravityProjects"),
+        os.path.join(os.path.expanduser("~"), "Documents", "antigravity")
+    ]
+    for base in bases:
+        if os.path.isdir(base):
+            try:
+                for name in os.listdir(base):
+                    p = os.path.join(base, name)
+                    if os.path.isdir(p) and not name.startswith('.'):
+                        ws_paths[name.lower()] = p
+            except Exception:
+                pass
+
+    # Dynamic scanning of IDE workspaceStorage directory (salvaged from legacy diagnostic scripts)
+    try:
+        from .environment import EnvironmentResolver
+        ws_storage_dir = EnvironmentResolver.get_workspace_storage_path()
+        if os.path.isdir(ws_storage_dir):
+            for entry in os.listdir(ws_storage_dir):
+                ws_json = os.path.join(ws_storage_dir, entry, "workspace.json")
+                if os.path.isfile(ws_json):
+                    try:
+                        import json
+                        with open(ws_json, "r", encoding="utf-8", errors="ignore") as fh:
+                            data = json.load(fh)
+                        uri = data.get("folder") or data.get("workspace")
+                        if uri and uri.startswith("file:///"):
+                            raw_path = uri[len("file:///"):]
+                            decoded_path = urllib.parse.unquote(raw_path)
+                            clean_path = decoded_path.replace("\\", "/").rstrip("/")
+                            name = clean_path.split("/")[-1]
+                            if name:
+                                ws_paths[name.lower()] = clean_path
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    text_lower = text.lower()
+
+    # 1. Semantic Topic Keyword mapping first (high confidence)
+    topic_mappings = {
+        "mitosis": "playground",
+        "calculator": "playground",
+        "black-scholes": "playground",
+        "nous portal": "hermes",
+        "nous_portal": "hermes",
+        "nous": "hermes",
+        "hermes": "hermes",
+        "options trader": "hermes",
+        "webui": "hermes",
+        "vps": "hermes",
+        "hindsight": "hermes",
+        "deduplication": "hermes",
+        "memory compaction": "hermes",
+        "discord.py": "hermes",
+        "discord bot": "hermes",
+        "ssh": "hermes",
+        "glassworm scanner": "glassworm_scanner",
+        "glassworm hunter": "glassworm_hunter",
+        "glassworm": "glassworm_scanner",
+        "moduledesigncriteria": "moduledesigncriteria",
+        "design criteria": "moduledesigncriteria",
+        "migration": "moduledesigncriteria",
+        "recovery": "moduledesigncriteria",
+        "daemon": "moduledesigncriteria",
+        "conversationtest": "conversationtest",
+        "playground": "playground",
+    }
+    for keyword, proj_name in topic_mappings.items():
+        if keyword in text_lower:
+            target_path = ws_paths.get(proj_name)
+            if target_path:
+                validated = validate_dir(target_path)
+                if validated:
+                    return validated
+
+    # 2. Direct URI extraction
+    uri_match = re.search(r"file:///([^\s\"'\]>)]+)", text)
+    if uri_match:
+        raw_uri_path = urllib.parse.unquote(uri_match.group(1))
+        clean_path = raw_uri_path.replace("\\", "/")
+        if len(clean_path) >= 2 and clean_path[1] == "%":
+            clean_path = clean_path.replace("%3A", ":").replace("%3a", ":")
+        
+        validated = validate_dir(clean_path)
+        if validated:
+            return validated
+
+    # 3. Direct absolute path extraction
+    path_match = re.search(r"([A-Za-z]:\\[^\s\"'\]>)]+)", text)
+    if not path_match:
+        path_match = re.search(r"([A-Za-z]:/[^\s\"'\]>)]+)", text)
+    if path_match:
+        raw_path = path_match.group(1)
+        validated = validate_dir(raw_path)
+        if validated:
+            return validated
+
+    # 4. Generic project folder name matching
+    for name in sorted(ws_paths.keys(), key=len, reverse=True):
+        if len(name) < 4:
+            pattern = r"\b" + re.escape(name) + r"\b"
+            if re.search(pattern, text_lower):
+                validated = validate_dir(ws_paths[name])
+                if validated:
+                    return validated
+        else:
+            if name in text_lower:
+                validated = validate_dir(ws_paths[name])
+                if validated:
+                    return validated
+
+    return None
 
 
 def run_recovery_pipeline(
@@ -499,16 +808,23 @@ def run_recovery_pipeline(
     except OSError as exc:
         return RecoveryResult(success=False, error=f"Cannot read conversations dir: {exc}")
 
-    all_pbs = sorted(
-        [f[:-3] for f in raw_files if f.endswith(".pb")],
-        key=lambda f: os.path.getmtime(os.path.join(convs_dir, f"{f}.pb")),
+    def get_mtime(f):
+        for ext in [".pb", ".db"]:
+            p = os.path.join(convs_dir, f"{f}{ext}")
+            if os.path.exists(p):
+                return os.path.getmtime(p)
+        return 0
+
+    all_cids = sorted(
+        list({f[:-3] for f in raw_files if f.endswith(".pb") or f.endswith(".db")}),
+        key=get_mtime,
         reverse=True,
     )
 
-    if not all_pbs:
+    if not all_cids:
         return RecoveryResult(success=True, conversations_rebuilt=0)
 
-    _progress("discovery", f"Found {len(all_pbs)} conversation(s). Extracting metadata...")
+    _progress("discovery", f"Found {len(all_cids)} conversation(s). Extracting metadata...")
 
     existing_titles: dict[str, str] = {}
     existing_inner_blobs: dict[str, bytes] = {}
@@ -531,15 +847,48 @@ def run_recovery_pipeline(
             except Exception:
                 pass
 
-    # Auto-assign workspaces from brain artifacts
-    for cid in all_pbs:
-        if cid not in ws_assignments:
-            inner = existing_inner_blobs.get(cid)
-            if inner and ProtobufEncoder.extract_workspace_hint(inner):
-                continue  # Already has workspace in PB blob
-            inferred = ArtifactParser.infer_workspace_from_brain(cid, brain_dir)
-            if inferred and os.path.isdir(inferred):
-                ws_assignments[cid] = build_workspace_dict(inferred)
+
+    # Auto-assign workspaces from brain artifacts / DB metadata / titles
+    for cid in all_cids:
+        # Priority 1: Extract workspace URI from DB trajectory metadata (highest confidence)
+        db_path_file = os.path.join(convs_dir, f"{cid}.db")
+        if os.path.exists(db_path_file):
+            inferred = extract_workspace_from_db(db_path_file)
+            matched_ws = find_matching_workspace(inferred)
+            if matched_ws:
+                ws_assignments[cid] = build_workspace_dict(matched_ws)
+                continue
+
+        # Priority 2: Check existing inner blob
+        inner = existing_inner_blobs.get(cid)
+        if inner:
+            inferred = ProtobufEncoder.extract_workspace_hint(inner)
+            matched_ws = find_matching_workspace(inferred)
+            if matched_ws:
+                ws_assignments[cid] = build_workspace_dict(matched_ws)
+                continue
+
+        # Priority 3: Infer from brain artifacts
+        inferred = ArtifactParser.infer_workspace_from_brain(cid, brain_dir)
+        matched_ws = find_matching_workspace(inferred)
+        if matched_ws:
+            ws_assignments[cid] = build_workspace_dict(matched_ws)
+            continue
+
+        # Priority 4: Scan DB steps payloads
+        if os.path.exists(db_path_file):
+            steps_content = extract_workspace_from_db_steps(db_path_file)
+            matched_ws = find_matching_workspace(steps_content)
+            if matched_ws:
+                ws_assignments[cid] = build_workspace_dict(matched_ws)
+                continue
+
+        # Priority 5: Fall back to conversation title keyword matching
+        title, _ = resolve_title(cid, existing_titles, brain_dir, convs_dir)
+        matched_ws = find_matching_workspace(title)
+        if matched_ws:
+            ws_assignments[cid] = build_workspace_dict(matched_ws)
+            continue
 
     # Fallback: assign dominant workspace to remaining unmapped conversations
     if ws_assignments:
@@ -548,23 +897,24 @@ def run_recovery_pipeline(
         if ws_counts:
             dominant_uri = ws_counts.most_common(1)[0][0]
             dominant_dict = next(v for v in ws_assignments.values() if v["uri_plain"] == dominant_uri)
-            for cid in all_pbs:
+            for cid in all_cids:
                 if cid not in ws_assignments:
                     inner = existing_inner_blobs.get(cid)
-                    if not (inner and ProtobufEncoder.extract_workspace_hint(inner)):
+                    existing_hint = ProtobufEncoder.extract_workspace_hint(inner) if inner else None
+                    if not existing_hint or not find_matching_workspace(existing_hint):
                         ws_assignments[cid] = dominant_dict
 
     # Resolve titles and build entries
     _progress("injection", "Building Protobuf entries...")
     resolved: list[tuple[str, str, str, Optional[bytes], bool]] = []
-    stats = {"brain": 0, "preserved": 0, "fallback": 0}
+    stats = {"brain": 0, "preserved": 0, "db": 0, "fallback": 0}
 
-    for cid in all_pbs:
+    for cid in all_cids:
         title, source = resolve_title(cid, existing_titles, brain_dir, convs_dir)
         inner_data = existing_inner_blobs.get(cid)
         has_ws = bool(inner_data and ProtobufEncoder.extract_workspace_hint(inner_data))
         resolved.append((cid, title, source, inner_data, has_ws))
-        stats[source] += 1
+        stats[source] = stats.get(source, 0) + 1
 
     # Phase 4: Backup — ALWAYS before any writes
     _progress("backup", "Creating safety backup...")
@@ -595,9 +945,11 @@ def run_recovery_pipeline(
         for cid, title, source, inner_data, has_ws in resolved:
             ws_map = ws_assignments.get(cid)
             pb_path = os.path.join(convs_dir, f"{cid}.pb")
+            db_path_file = os.path.join(convs_dir, f"{cid}.db")
+            active_path = pb_path if os.path.exists(pb_path) else db_path_file
 
-            pb_mtime = int(os.path.getmtime(pb_path)) if os.path.exists(pb_path) else int(time.time())
-            pb_ctime = int(os.path.getctime(pb_path)) if os.path.exists(pb_path) else int(time.time())
+            pb_mtime = int(os.path.getmtime(active_path)) if os.path.exists(active_path) else int(time.time())
+            pb_ctime = int(os.path.getctime(active_path)) if os.path.exists(active_path) else int(time.time())
 
             entry = ProtobufEncoder.build_trajectory_entry(
                 cid, title, ws_map, pb_ctime, pb_mtime, existing_inner_data=inner_data
@@ -631,6 +983,17 @@ def run_recovery_pipeline(
             for stale in stale_cids:
                 del entries[stale]
             stats_json["json_deleted"] = len(stale_cids)
+
+            # Sort the entries in JSON index by lastModified descending (newest first)
+            sorted_entries = {}
+            sorted_keys = sorted(
+                entries.keys(),
+                key=lambda k: entries[k].get("lastModified", 0),
+                reverse=True,
+            )
+            for k in sorted_keys:
+                sorted_entries[k] = entries[k]
+            chat_idx["entries"] = sorted_entries
         else:
             stats_json["json_deleted"] = 0
             

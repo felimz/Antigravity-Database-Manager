@@ -31,6 +31,7 @@ class ArtifactParser:
         if not os.path.isdir(target_dir):
             return None
 
+        # First try exact matches
         for artifact_file in TITLE_ARTIFACT_FILES:
             filepath = os.path.join(target_dir, artifact_file)
             if os.path.isfile(filepath):
@@ -38,13 +39,45 @@ class ArtifactParser:
                 if title:
                     return title
 
+        # Fallback to searching all md files with keywords
+        try:
+            for name in os.listdir(target_dir):
+                if name.endswith(".md") and not name.startswith(".") and any(k in name.lower() for k in ["task", "plan", "walkthrough", "goal"]):
+                    filepath = os.path.join(target_dir, name)
+                    title = ArtifactParser._read_first_heading(filepath)
+                    if title:
+                        return title
+        except OSError:
+            pass
+
         overview_path = os.path.join(target_dir, OVERVIEW_SUBPATH)
         if os.path.isfile(overview_path):
             try:
+                import json
                 with open(overview_path, "r", encoding="utf-8", errors="replace") as fh:
                     for line in fh:
                         clean = line.strip()
-                        if clean and not clean.startswith("#") and len(clean) > MIN_TITLE_LENGTH:
+                        if not clean:
+                            continue
+                        if clean.startswith("{"):
+                            try:
+                                data = json.loads(clean)
+                                if isinstance(data, dict):
+                                    content = data.get("content", "")
+                                    # Extract <USER_REQUEST> if present
+                                    match = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", content, re.DOTALL | re.IGNORECASE)
+                                    if match:
+                                        req_text = match.group(1).strip()
+                                        req_text = re.sub(r"\s+", " ", req_text)
+                                        if len(req_text) > MIN_TITLE_LENGTH:
+                                            return req_text[:MAX_TITLE_LENGTH]
+                                    # Fallback to general content
+                                    content_clean = re.sub(r"\s+", " ", content).strip()
+                                    if len(content_clean) > MIN_TITLE_LENGTH:
+                                        return content_clean[:MAX_TITLE_LENGTH]
+                            except Exception:
+                                pass
+                        elif not clean.startswith("#") and len(clean) > MIN_TITLE_LENGTH:
                             return clean[:MAX_TITLE_LENGTH]
             except OSError:
                 pass

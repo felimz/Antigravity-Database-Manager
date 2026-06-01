@@ -42,6 +42,12 @@ from src.ui_headless.controller import run_interactive
 
 
 def main() -> None:
+    if sys.platform.startswith("win"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+            sys.stderr.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
     """
     Application entry point.
 
