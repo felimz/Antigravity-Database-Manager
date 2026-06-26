@@ -43,3 +43,7 @@ backups/
 # Archives (release artifacts)
 *.7z
 *.zip
+
+# Logs
+*.log
+

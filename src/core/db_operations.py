@@ -780,6 +780,52 @@ def find_matching_workspace(hint_or_blob) -> str | None:
     return None
 
 
+
+def _extract_pb_modify_timestamp(inner_data: bytes) -> int | None:
+    """
+    Extract the modification timestamp (field 7, sub-field 1 = seconds)
+    from a Protobuf inner blob. Falls back to field 10 if field 7 is absent.
+    Returns epoch seconds or None.
+    """
+    try:
+        pos = 0
+        best_ts = None
+        while pos < len(inner_data):
+            tag, pos = ProtobufEncoder.decode_varint(inner_data, pos)
+            wire_type = tag & 7
+            field_num = tag >> 3
+            if wire_type == 2:
+                length, pos = ProtobufEncoder.decode_varint(inner_data, pos)
+                content = inner_data[pos:pos + length]
+                pos += length
+                if field_num in (7, 10):
+                    # Parse timestamp sub-message: field 1 = seconds
+                    sub_pos = 0
+                    while sub_pos < len(content):
+                        sub_tag, sub_pos = ProtobufEncoder.decode_varint(content, sub_pos)
+                        sub_fn = sub_tag >> 3
+                        sub_wt = sub_tag & 7
+                        if sub_fn == 1 and sub_wt == 0:
+                            val, sub_pos = ProtobufEncoder.decode_varint(content, sub_pos)
+                            if field_num == 7:
+                                return val  # Prefer field 7 (last modified)
+                            if best_ts is None:
+                                best_ts = val  # Field 10 as fallback
+                        else:
+                            sub_pos = ProtobufEncoder.skip_protobuf_field(content, sub_pos, sub_wt)
+            elif wire_type == 0:
+                _, pos = ProtobufEncoder.decode_varint(inner_data, pos)
+            elif wire_type == 1:
+                pos += 8
+            elif wire_type == 5:
+                pos += 4
+            else:
+                break
+        return best_ts
+    except Exception:
+        return None
+
+
 def run_recovery_pipeline(
     db_path: str,
     convs_dir: str,
@@ -942,6 +988,9 @@ def run_recovery_pipeline(
         except (json.JSONDecodeError, TypeError):
             chat_idx = {"version": 1, "entries": {}}
 
+        # Collect entries with their effective timestamps for sorting
+        built_entries: list[tuple[int, bytes]] = []  # (effective_mtime, entry_bytes)
+
         for cid, title, source, inner_data, has_ws in resolved:
             ws_map = ws_assignments.get(cid)
             pb_path = os.path.join(convs_dir, f"{cid}.pb")
@@ -954,14 +1003,49 @@ def run_recovery_pipeline(
             entry = ProtobufEncoder.build_trajectory_entry(
                 cid, title, ws_map, pb_ctime, pb_mtime, existing_inner_data=inner_data
             )
-            result_bytes += entry
+
+            # Determine effective timestamp for sorting:
+            # Use file modification time (mtime) as the sort key. On Windows,
+            # mtime reflects the last time the conversation was written to,
+            # which is the correct semantic for "last modified" sort ordering.
+            # Note: ctime on Windows is the file creation date, which does NOT
+            # update when a conversation is modified — using it causes stale
+            # entries to appear out of order in the sidebar.
+            #
+            # Fallback: If file mtime appears batch-corrupted (many files
+            # sharing the same second from a migration run), use the brain
+            # directory's newest artifact timestamp as a tiebreaker.
+            effective_ts = pb_mtime
+
+            # Check brain dir for a more accurate timestamp
+            brain_conv_dir = os.path.join(brain_dir, cid)
+            if os.path.isdir(brain_conv_dir):
+                try:
+                    brain_newest = 0
+                    for root, _dirs, _files in os.walk(brain_conv_dir):
+                        for fname in _files:
+                            fpath = os.path.join(root, fname)
+                            try:
+                                mt = int(os.path.getmtime(fpath))
+                                if mt > brain_newest:
+                                    brain_newest = mt
+                            except OSError:
+                                pass
+                    if brain_newest > 0 and brain_newest != effective_ts:
+                        # Use brain timestamp if it's more specific (differs
+                        # from file mtime, suggesting the file was batch-touched)
+                        effective_ts = brain_newest
+                except Exception:
+                    pass
+
+            built_entries.append((effective_ts, entry))
 
             if has_ws or ws_map:
                 ws_total += 1
             if pb_mtime and (not inner_data or not ProtobufEncoder.has_timestamp_fields(inner_data)):
                 ts_injected += 1
 
-            mtime_ms = pb_mtime * 1000
+            mtime_ms = effective_ts * 1000
             if cid not in chat_idx.setdefault("entries", {}):
                 chat_idx["entries"][cid] = {
                     "sessionId": cid,
@@ -974,6 +1058,11 @@ def run_recovery_pipeline(
                 chat_idx["entries"][cid]["title"] = title
                 chat_idx["entries"][cid]["lastModified"] = mtime_ms
                 stats_json["json_patched"] += 1
+
+        # Sort PB entries by effective timestamp descending (newest first)
+        # This determines sidebar display order
+        built_entries.sort(key=lambda x: x[0], reverse=True)
+        result_bytes = b"".join(entry_bytes for _, entry_bytes in built_entries)
 
         # Prune JSON orphans safely
         valid_cids = {r[0] for r in resolved}

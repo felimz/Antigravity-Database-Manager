@@ -174,6 +174,37 @@ class ProtobufEncoder:
         return False
 
     @classmethod
+    def _extract_field_timestamp(cls, inner_blob: bytes, target_field: int) -> int | None:
+        """Extract the seconds value from a specific timestamp field in the inner blob."""
+        if not inner_blob:
+            return None
+        try:
+            pos = 0
+            while pos < len(inner_blob):
+                tag, pos = cls.decode_varint(inner_blob, pos)
+                fn = tag >> 3
+                wt = tag & 7
+                if fn == target_field and wt == 2:
+                    length, pos = cls.decode_varint(inner_blob, pos)
+                    content = inner_blob[pos:pos + length]
+                    pos += length
+                    # Parse timestamp sub-message: field 1 = seconds
+                    sub_pos = 0
+                    while sub_pos < len(content):
+                        sub_tag, sub_pos = cls.decode_varint(content, sub_pos)
+                        sub_fn = sub_tag >> 3
+                        sub_wt = sub_tag & 7
+                        if sub_fn == 1 and sub_wt == 0:
+                            val, _ = cls.decode_varint(content, sub_pos)
+                            return val
+                        sub_pos = cls.skip_protobuf_field(content, sub_pos, sub_wt)
+                else:
+                    pos = cls.skip_protobuf_field(inner_blob, pos, wt)
+        except Exception:
+            pass
+        return None
+
+    @classmethod
     def extract_workspace_hint(cls, inner_blob: bytes) -> str | None:
         """
         Extract a workspace URI from the protobuf inner blob.
