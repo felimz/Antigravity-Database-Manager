@@ -51,15 +51,16 @@ def build_workspace_dict(path: str) -> dict[str, str]:
     required by the Protobuf schema (Fields 9 and 17) mapping.
     """
     import sys
+    import urllib.parse
     path_normalized = path.replace("\\", "/").rstrip("/")
     if sys.platform.startswith("win") and len(path_normalized) >= 2 and path_normalized[1] == ":":
         path_normalized = path_normalized[0].lower() + path_normalized[1:]
     
     folder_name = os.path.basename(path_normalized) or "RecoveredProject"
 
-    uri_path_encoded = urllib.parse.quote(path_normalized, safe="/")
-    uri_encoded = f"file:///{uri_path_encoded}"
     uri_plain = f"file:///{path_normalized}"
+    # Use raw colon instead of percent-encoded colon to match VS Code's runtime representation
+    uri_encoded = uri_plain
 
     return {
         "uri_encoded": uri_encoded,
@@ -68,6 +69,7 @@ def build_workspace_dict(path: str) -> dict[str, str]:
         "git_remote": f"https://github.com/local/{folder_name}.git",
         "branch": "main",
     }
+
 
 
 # ==============================================================================

@@ -48,31 +48,31 @@ from src.core.environment import EnvironmentResolver
 # Shared URI Normalization Helpers
 # =============================================================================
 
-def normalize_uri_to_encoded(val):
-    """Normalize a single string value: replace file:///X: with file:///X%3A."""
+def normalize_uri_to_raw(val):
+    """Normalize a single string value: replace file:///X%3A or file:///X: with file:///x:."""
     if isinstance(val, str) and val.startswith("file:///"):
-        return re.sub(
-            r'^(file:///)([A-Za-z]):(/)',
-            r'\1\2%3A\3',
-            val
-        )
+        # Replace percent-encoded colon with raw colon
+        val = re.sub(r'^(file:///)([a-zA-Z])%3[Aa](/)', r'\1\2:\3', val)
+        # Force lowercase drive letter
+        val = re.sub(r'^(file:///)([a-zA-Z]):(/)', lambda m: m.group(1) + m.group(2).lower() + m.group(3), val)
     return val
 
 
-def normalize_obj_to_encoded(obj):
-    """Recursively normalize all strings in a JSON-like object."""
+def normalize_obj_to_raw(obj):
+    """Recursively normalize all strings in a JSON-like object to use raw colons."""
     if isinstance(obj, dict):
         new_dict = {}
         for k, v in obj.items():
-            new_key = normalize_uri_to_encoded(k)
-            new_val = normalize_obj_to_encoded(v)
+            new_key = normalize_uri_to_raw(k)
+            new_val = normalize_obj_to_raw(v)
             new_dict[new_key] = new_val
         return new_dict
     elif isinstance(obj, list):
-        return [normalize_obj_to_encoded(x) for x in obj]
+        return [normalize_obj_to_raw(x) for x in obj]
     elif isinstance(obj, str):
-        return normalize_uri_to_encoded(obj)
+        return normalize_uri_to_raw(obj)
     return obj
+
 
 
 # =============================================================================
@@ -121,11 +121,11 @@ def patch_storage_json(storage_path):
     with open(storage_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    normalized_data = normalize_obj_to_encoded(data)
+    normalized_data = normalize_obj_to_raw(data)
 
     with open(storage_path, "w", encoding="utf-8") as f:
         json.dump(normalized_data, f, indent=2, ensure_ascii=False)
-    print("Successfully normalized storage.json workspace paths to %3A.")
+    print("Successfully normalized storage.json workspace paths to raw colons.")
 
 
 def patch_workspace_storage(workspace_storage_dir):
@@ -142,7 +142,7 @@ def patch_workspace_storage(workspace_storage_dir):
                 with open(ws_json, "r", encoding="utf-8") as f:
                     wdata = json.load(f)
 
-                normalized_wdata = normalize_obj_to_encoded(wdata)
+                normalized_wdata = normalize_obj_to_raw(wdata)
 
                 if wdata != normalized_wdata:
                     shutil.copy2(ws_json, ws_json + ".backup")
@@ -152,132 +152,20 @@ def patch_workspace_storage(workspace_storage_dir):
             except Exception as e:
                 print(f"Error patching {ws_json}: {e}")
 
-    print(f"Normalized {patched_count} workspace.json files in workspaceStorage.")
+    print(f"Normalized {patched_count} workspace.json files in workspaceStorage to raw colons.")
 
 
 def patch_workbench_js():
-    """Patch workbench.desktop.main.js to normalize URIs at deserialization time."""
-    js_path = os.path.join(
-        os.environ.get("LOCALAPPDATA", ""),
-        "Programs", "Antigravity IDE", "resources", "app", "out",
-        "vs", "workbench", "workbench.desktop.main.js"
-    )
-    if not os.path.exists(js_path):
-        print(f"[WARNING] workbench.desktop.main.js not found at {js_path}. Skipping JS patch.")
-        return
-
-    backup_path = js_path + ".bak"
-    if not os.path.exists(backup_path):
-        print(f"Creating backup of workbench.desktop.main.js at: {backup_path}")
-        try:
-            shutil.copy2(js_path, backup_path)
-        except Exception as e:
-            print(f"[ERROR] Failed to create JS backup: {e}")
-            return
-    else:
-        print(f"JS Backup already exists at: {backup_path}")
-
-    print("Reading and patching workbench.desktop.main.js...")
-    try:
-        with open(js_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-
-        # We support multiple minified signatures across different IDE versions
-        signatures = [
-            # Current version: function DC(t,e){return BPt(e,sLu(t))}
-            {
-                "target": "function DC(t,e){return BPt(e,sLu(t))}",
-                "replacement": (
-                    'function DC(t,e){const res=BPt(e,sLu(t));if(res&&Array.isArray(res.workspaces))'
-                    '{for(const w of res.workspaces){if(w&&typeof w.workspaceFolderAbsoluteUri==="string")'
-                    '{w.workspaceFolderAbsoluteUri=w.workspaceFolderAbsoluteUri.replace('
-                    '/file:\\/\\/\\/([a-zA-Z]):/g,"file:///$1%3A")}if(w&&typeof w.gitRootAbsoluteUri==="string")'
-                    '{w.gitRootAbsoluteUri=w.gitRootAbsoluteUri.replace('
-                    '/file:\\/\\/\\/([a-zA-Z]):/g,"file:///$1%3A")}}}return res}'
-                )
-            },
-            # Previous version: function hR(t,e){return yOt(e,Bku(t))}
-            {
-                "target": "function hR(t,e){return yOt(e,Bku(t))}",
-                "replacement": (
-                    'function hR(t,e){const res=yOt(e,Bku(t));if(res&&Array.isArray(res.workspaces))'
-                    '{for(const w of res.workspaces){if(w&&typeof w.workspaceFolderAbsoluteUri==="string")'
-                    '{w.workspaceFolderAbsoluteUri=w.workspaceFolderAbsoluteUri.replace('
-                    '/file:\\/\\/\\/([a-zA-Z]):/g,"file:///$1%3A")}if(w&&typeof w.gitRootAbsoluteUri==="string")'
-                    '{w.gitRootAbsoluteUri=w.gitRootAbsoluteUri.replace('
-                    '/file:\\/\\/\\/([a-zA-Z]):/g,"file:///$1%3A")}}}return res}'
-                )
-            }
-        ]
-
-        patched = False
-        for sig in signatures:
-            if sig["target"] in content:
-                content = content.replace(sig["target"], sig["replacement"])
-                with open(js_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                print("Successfully patched workbench.desktop.main.js for in-memory URI normalization!")
-                patched = True
-                break
-            elif sig["replacement"] in content:
-                print("workbench.desktop.main.js is already patched.")
-                patched = True
-                break
-
-        if not patched:
-            print("[WARNING] Target signature not found in workbench.desktop.main.js. Skipping JS patch.")
-    except Exception as e:
-        print(f"[ERROR] Failed to patch workbench.desktop.main.js: {e}")
+    """No-op: workbench JS patching is no longer needed since we use raw colons."""
+    print("Skipping JS patch (IDE natively supports raw colons in-memory).")
+    return
 
 
 def patch_product_json_checksum():
-    """Recalculate the SHA-256 checksum for the patched JS file in product.json."""
-    localappdata = os.environ.get("LOCALAPPDATA", "")
-    js_path = os.path.join(
-        localappdata, "Programs", "Antigravity IDE", "resources", "app", "out",
-        "vs", "workbench", "workbench.desktop.main.js"
-    )
-    product_json_path = os.path.join(
-        localappdata, "Programs", "Antigravity IDE", "resources", "app", "product.json"
-    )
+    """No-op: product.json patching is no longer needed since we do not modify workbench JS."""
+    print("Skipping product.json checksum update.")
+    return
 
-    if not os.path.exists(js_path) or not os.path.exists(product_json_path):
-        print("[WARNING] Could not find JS file or product.json to update checksums.")
-        return
-
-    print("Calculating new checksum for workbench.desktop.main.js...")
-    try:
-        with open(js_path, "rb") as f:
-            data = f.read()
-        import hashlib
-        import base64
-        sha = hashlib.sha256(data).digest()
-        new_checksum = base64.b64encode(sha).decode('utf-8').rstrip('=')
-        print(f"New checksum: {new_checksum}")
-
-        product_backup = product_json_path + ".bak"
-        if not os.path.exists(product_backup):
-            print(f"Backing up product.json to {product_backup}...")
-            shutil.copy2(product_json_path, product_backup)
-        else:
-            print(f"product.json backup already exists at: {product_backup}")
-
-        with open(product_json_path, "r", encoding="utf-8") as f:
-            pdata = json.load(f)
-
-        if "checksums" in pdata:
-            key = "vs/workbench/workbench.desktop.main.js"
-            old_checksum = pdata["checksums"].get(key)
-            print(f"Updating checksum key '{key}' from {old_checksum} to {new_checksum}...")
-            pdata["checksums"][key] = new_checksum
-
-            with open(product_json_path, "w", encoding="utf-8") as f:
-                json.dump(pdata, f, indent=2, ensure_ascii=False)
-            print("Successfully updated product.json with the new checksum!")
-        else:
-            print("[WARNING] 'checksums' key not found in product.json.")
-    except Exception as e:
-        print(f"[ERROR] Failed to update product.json checksum: {e}")
 
 
 # =============================================================================
@@ -384,7 +272,10 @@ def process_protobuf_message(data):
         try:
             text = data.decode('utf-8')
             if "file:///" in text:
-                new_text = re.sub(r'file:///([a-zA-Z]):', r'file:///\1%3A', text)
+                # Replace percent-encoded colon with raw colon
+                new_text = re.sub(r'file:///([a-zA-Z])%3[Aa]', r'file:///\1:', text)
+                # Lowercase drive letters
+                new_text = re.sub(r'file:///([a-zA-Z]):', lambda m: f"file:///{m.group(1).lower()}:", new_text)
                 if new_text != text:
                     print(f"    Normalizing URI: {text[:80]}")
                     print(f"                  -> {new_text[:80]}")
