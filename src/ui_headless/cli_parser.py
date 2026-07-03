@@ -117,6 +117,16 @@ def build_parser() -> argparse.ArgumentParser:
     del_st_parser = st_sub.add_parser("delete", help="Delete a key by dotted path")
     del_st_parser.add_argument("key", help="Dotted key path")
 
+    # --- prune ---
+    prune_parser = subparsers.add_parser("prune", help="Prune conversations or artifacts to clean up cache")
+    prune_parser.add_argument("--max-size", type=int, help="Target cache size in MB to prune down to (e.g., 500)")
+    prune_parser.add_argument("--media-only", action="store_true", help="Only delete visual media assets (webp, png, etc.)")
+    prune_parser.add_argument("--logs-only", action="store_true", help="Only delete log files (.jsonl, .log)")
+    prune_parser.add_argument("--scratch-only", action="store_true", help="Only delete scratchpad files")
+    prune_parser.add_argument("--conversations", help="Comma-separated UUIDs of entire conversations to purge")
+    prune_parser.add_argument("--dry-run", action="store_true", help="Calculate potential space savings without deleting")
+    prune_parser.add_argument("--force", "-f", action="store_true", help="Skip confirmation prompts")
+
     return parser
 
 
@@ -159,6 +169,8 @@ def execute(args: argparse.Namespace, ctx: ApplicationContext) -> int:
         return _cmd_workspace(args, ctx)
     elif cmd == "storage":
         return _cmd_storage(args, ctx)
+    elif cmd == "prune":
+        return _cmd_prune(args, ctx)
     else:
         build_parser().print_help()
         return 1
@@ -535,3 +547,188 @@ def _cmd_repair(args: argparse.Namespace, ctx: ApplicationContext) -> int:
     else:
         Logger.error(f"Repair failed: {result.error}")
         return 1
+
+
+def _cmd_prune(args: argparse.Namespace, ctx: ApplicationContext) -> int:
+    from .logger import Logger
+    import json as _json
+
+    # 1. Generate size report
+    report = ops.get_cache_size_report(ctx.db_path, ctx.convs_dir, ctx.brain_dir)
+
+    total_db_pb = sum(item["db_pb_size"] for item in report.values())
+    total_brain = sum(item["brain_size"] for item in report.values())
+    total_cache = total_db_pb + total_brain
+
+    # Check if we should delegate to interactive controller
+    is_interactive = not (
+        args.max_size is not None or
+        args.conversations is not None or
+        args.media_only or
+        args.logs_only or
+        args.scratch_only
+    )
+
+    if is_interactive:
+        from .controller import run_prune_interactive
+        run_prune_interactive(ctx, report)
+        return 0
+
+    # Non-interactive CLI command execution
+    dry_run = getattr(args, "dry_run", False)
+    force = getattr(args, "force", False)
+
+    Logger.header("Cache Pruning Process" + (" (DRY RUN)" if dry_run else ""))
+    Logger.info(f"Current Cache Size: {total_cache / (1024 * 1024):.2f} MB")
+    Logger.info(f"  - Conversations DB/PB: {total_db_pb / (1024 * 1024):.2f} MB")
+    Logger.info(f"  - Brain Artifacts:     {total_brain / (1024 * 1024):.2f} MB")
+
+    to_delete_entire = set()
+    to_prune_artifacts = {}  # uuid -> {media, logs, scratch, all}
+
+    # A. Direct conversations list
+    if args.conversations:
+        uuids = [u.strip() for u in args.conversations.split(",")]
+        for u in uuids:
+            if u in report:
+                to_delete_entire.add(u)
+            else:
+                Logger.warn(f"Conversation UUID {u} not found in cache. Skipping.")
+
+    # B. Target size auto-pruning
+    elif args.max_size is not None:
+        target_bytes = args.max_size * 1024 * 1024
+        if total_cache <= target_bytes:
+            Logger.success(f"Cache is already under target size of {args.max_size} MB.")
+            return 0
+
+        bytes_to_free = total_cache - target_bytes
+        Logger.info(f"Targeting savings of: {bytes_to_free / (1024 * 1024):.2f} MB")
+
+        # By default, we prune media first across all conversations (non-destructive)
+        media_savings = sum(item["media_size"] for item in report.values())
+        saved_so_far = 0
+
+        if args.media_only:
+            # If explicitly requested media-only, just do media
+            for u in report:
+                to_prune_artifacts[u] = {"media_only": True}
+                saved_so_far += report[u]["media_size"]
+        else:
+            # Plan: first prune media from all conversations, then oldest conversations if needed
+            for u in report:
+                media_sz = report[u]["media_size"]
+                if media_sz > 0:
+                    to_prune_artifacts[u] = {"media_only": True}
+                    saved_so_far += media_sz
+
+            if total_cache - saved_so_far > target_bytes:
+                # Still need to delete entire conversations. Sort by mtime ascending (oldest first)
+                sorted_by_age = sorted(report.items(), key=lambda x: x[1]["mtime"])
+                for u, item in sorted_by_age:
+                    if total_cache - saved_so_far <= target_bytes:
+                        break
+                    if u in to_prune_artifacts:
+                        del to_prune_artifacts[u]
+                    to_delete_entire.add(u)
+                    saved_so_far += (item["db_pb_size"] + item["brain_size"])
+
+    # C. Selective global file-type pruning
+    elif args.media_only or args.logs_only or args.scratch_only:
+        for u in report:
+            to_prune_artifacts[u] = {
+                "media_only": args.media_only,
+                "logs_only": args.logs_only,
+                "scratch_only": args.scratch_only
+            }
+
+    # Print summary of actions
+    if not to_delete_entire and not to_prune_artifacts:
+        Logger.info("No pruning actions required or matching files found.")
+        return 0
+
+    estimated_savings = 0
+    if to_delete_entire:
+        print("\nThe following conversations will be DELETED ENTIRELY:")
+        for u in to_delete_entire:
+            item = report[u]
+            sz = (item["db_pb_size"] + item["brain_size"]) / (1024 * 1024)
+            print(f"  - {u} | {sz:.2f} MB | {item['title']}")
+            estimated_savings += (item["db_pb_size"] + item["brain_size"])
+
+    if to_prune_artifacts:
+        print("\nThe following conversation brain directories will have artifacts PRUNED:")
+        for u, opts in to_prune_artifacts.items():
+            item = report[u]
+            types = []
+            sz = 0
+            if opts.get("media_only"):
+                types.append("media")
+                sz += item["media_size"]
+            if opts.get("logs_only"):
+                types.append("logs")
+                sz += item["log_size"]
+            if opts.get("scratch_only"):
+                types.append("scratch")
+                sz += item["other_size"]
+            if not types:
+                types.append("all non-essential")
+                sz += item["brain_size"]
+            print(f"  - {u} | {sz / (1024 * 1024):.2f} MB | Pruning {', '.join(types)} | {item['title']}")
+            estimated_savings += sz
+
+    Logger.info(f"\nEstimated space to free: {estimated_savings / (1024 * 1024):.2f} MB")
+
+    if dry_run:
+        Logger.success("Dry run completed. No files were deleted.")
+        return 0
+
+    if not force:
+        try:
+            confirm = input("\nAre you sure you want to proceed with pruning? (y/N): ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            confirm = "n"
+        if confirm != "y":
+            Logger.info("Pruning cancelled.")
+            return 0
+
+    # Execute pruning
+    Logger.info("\nExecuting pruning operations...")
+
+    deleted_count = 0
+    pruned_count = 0
+    actual_saved = 0
+
+    # Perform deletions
+    for u in to_delete_entire:
+        item = report[u]
+        total_sz = item["db_pb_size"] + item["brain_size"]
+        if ops.purge_conversation_data(ctx.db_path, ctx.convs_dir, ctx.brain_dir, u):
+            Logger.success(f"Purged entire conversation: {u}")
+            deleted_count += 1
+            actual_saved += total_sz
+        else:
+            Logger.error(f"Failed to purge conversation: {u}")
+
+    for u, opts in to_prune_artifacts.items():
+        media = opts.get("media_only", False)
+        logs = opts.get("logs_only", False)
+        scratch = opts.get("scratch_only", False)
+
+        # If none of the specific flags are True, delete non-essential files
+        if not media and not logs and not scratch:
+            saved = ops.prune_conversation_artifacts(ctx.brain_dir, u, media_only=False, logs_only=False, scratch_only=False)
+        else:
+            saved = ops.prune_conversation_artifacts(ctx.brain_dir, u, media_only=media, logs_only=logs, scratch_only=scratch)
+
+        if saved > 0:
+            Logger.success(f"Pruned artifacts for {u} ({saved / (1024 * 1024):.2f} MB saved)")
+            pruned_count += 1
+            actual_saved += saved
+
+    Logger.success(f"\nPruning complete! Freed {actual_saved / (1024 * 1024):.2f} MB of space.")
+    Logger.info(f"  - Conversations purged: {deleted_count}")
+    Logger.info(f"  - Conversations pruned: {pruned_count}")
+
+    return 0

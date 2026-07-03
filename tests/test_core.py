@@ -724,5 +724,108 @@ class TestWorkspaceAssignment(unittest.TestCase):
             self.assertIsNone(ws)
 
 
+# ==============================================================================
+# TEST: CACHE PRUNING UTILITIES
+# ==============================================================================
+
+class TestCachePruning(unittest.TestCase):
+    """Tests for cache pruning utilities."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmpdir, "state.vscdb")
+        self.convs_dir = os.path.join(self.tmpdir, "conversations")
+        self.brain_dir = os.path.join(self.tmpdir, "brain")
+        os.makedirs(self.convs_dir, exist_ok=True)
+        os.makedirs(self.brain_dir, exist_ok=True)
+        ops.create_empty_db(self.db_path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_get_cache_size_report_empty(self):
+        report = ops.get_cache_size_report(self.db_path, self.convs_dir, self.brain_dir)
+        self.assertEqual(len(report), 0)
+
+    def test_get_cache_size_report_with_data(self):
+        uuid_1 = "11111111-2222-3333-4444-555555555555"
+        # Create conversation files
+        with open(os.path.join(self.convs_dir, f"{uuid_1}.db"), "wb") as f:
+            f.write(b"a" * 100)
+        # Create brain files
+        uuid_brain = os.path.join(self.brain_dir, uuid_1)
+        os.makedirs(uuid_brain, exist_ok=True)
+        with open(os.path.join(uuid_brain, "task.md"), "wb") as f:
+            f.write(b"# Test Title\n")
+        with open(os.path.join(uuid_brain, "image.webp"), "wb") as f:
+            f.write(b"b" * 50)
+
+        report = ops.get_cache_size_report(self.db_path, self.convs_dir, self.brain_dir)
+        self.assertIn(uuid_1, report)
+        self.assertEqual(report[uuid_1]["db_pb_size"], 100)
+        self.assertEqual(report[uuid_1]["brain_size"], len(b"# Test Title\n") + 50)
+        self.assertEqual(report[uuid_1]["media_size"], 50)
+        self.assertEqual(report[uuid_1]["title"], "Test Title")
+
+    def test_prune_conversation_artifacts(self):
+        uuid_1 = "11111111-2222-3333-4444-555555555555"
+        uuid_brain = os.path.join(self.brain_dir, uuid_1)
+        os.makedirs(uuid_brain, exist_ok=True)
+        # Write files
+        with open(os.path.join(uuid_brain, "task.md"), "wb") as f:
+            f.write(b"# Test Title\n")
+        with open(os.path.join(uuid_brain, "image.webp"), "wb") as f:
+            f.write(b"webp" * 10)
+        with open(os.path.join(uuid_brain, "log.jsonl"), "wb") as f:
+            f.write(b"log\n")
+
+        # Prune only media
+        saved = ops.prune_conversation_artifacts(self.brain_dir, uuid_1, media_only=True)
+        self.assertEqual(saved, 40)
+        self.assertFalse(os.path.exists(os.path.join(uuid_brain, "image.webp")))
+        self.assertTrue(os.path.exists(os.path.join(uuid_brain, "task.md")))
+        self.assertTrue(os.path.exists(os.path.join(uuid_brain, "log.jsonl")))
+
+        # Prune logs
+        saved = ops.prune_conversation_artifacts(self.brain_dir, uuid_1, media_only=False, logs_only=True)
+        self.assertEqual(saved, 4)
+        self.assertFalse(os.path.exists(os.path.join(uuid_brain, "log.jsonl")))
+        self.assertTrue(os.path.exists(os.path.join(uuid_brain, "task.md")))
+
+    def test_purge_conversation_data(self):
+        uuid_1 = "11111111-2222-3333-4444-555555555555"
+        # Set up database index
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO ItemTable VALUES (?, ?)", (JSON_KEY, '{"version": 1, "entries": {"11111111-2222-3333-4444-555555555555": {"sessionId": "11111111-2222-3333-4444-555555555555", "title": "Test"}}}'))
+        conn.commit()
+        conn.close()
+
+        # Create files
+        db_file = os.path.join(self.convs_dir, f"{uuid_1}.db")
+        with open(db_file, "w") as f:
+            f.write("a")
+        brain_folder = os.path.join(self.brain_dir, uuid_1)
+        os.makedirs(brain_folder, exist_ok=True)
+        with open(os.path.join(brain_folder, "task.md"), "w") as f:
+            f.write("# A")
+
+        # Purge
+        success = ops.purge_conversation_data(self.db_path, self.convs_dir, self.brain_dir, uuid_1)
+        self.assertTrue(success)
+        self.assertFalse(os.path.exists(db_file))
+        self.assertFalse(os.path.exists(brain_folder))
+
+        # Check database index is updated
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM ItemTable WHERE key=?", (JSON_KEY,))
+        row = cur.fetchone()
+        self.assertNotIn(uuid_1, row[0])
+        conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

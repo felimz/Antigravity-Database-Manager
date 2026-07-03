@@ -52,6 +52,7 @@ def build_workspace_dict(path: str) -> dict[str, str]:
     """
     import sys
     import urllib.parse
+    import re
     path_normalized = path.replace("\\", "/").rstrip("/")
     if sys.platform.startswith("win") and len(path_normalized) >= 2 and path_normalized[1] == ":":
         path_normalized = path_normalized[0].lower() + path_normalized[1:]
@@ -59,8 +60,11 @@ def build_workspace_dict(path: str) -> dict[str, str]:
     folder_name = os.path.basename(path_normalized) or "RecoveredProject"
 
     uri_plain = f"file:///{path_normalized}"
-    # Use raw colon instead of percent-encoded colon to match VS Code's runtime representation
-    uri_encoded = uri_plain
+    # Use percent-encoded colon to match VS Code's runtime representation on Windows
+    if sys.platform.startswith("win"):
+        uri_encoded = re.sub(r'^(file:///)([a-zA-Z]):', r'\1\2%3A', uri_plain)
+    else:
+        uri_encoded = uri_plain
 
     return {
         "uri_encoded": uri_encoded,
@@ -1638,3 +1642,182 @@ def _extract_workspace_uri_from_field9(ws_msg: bytes) -> str:
     except Exception:
         pass
     return ""
+
+
+# ==============================================================================
+# CACHE PRUNING UTILITIES
+# ==============================================================================
+
+def get_cache_size_report(db_path: str, convs_dir: str, brain_dir: str) -> dict[str, dict[str, Any]]:
+    """
+    Scans the conversations and brain directories to compile a size report per UUID.
+    """
+    # Read existing titles from state.vscdb
+    existing_titles: dict[str, str] = {}
+    meta_conn = None
+    try:
+        meta_conn = sqlite3.connect(db_path)
+        cur = meta_conn.cursor()
+        cur.execute("SELECT value FROM ItemTable WHERE key=?", (PB_KEY,))
+        row = cur.fetchone()
+        if row and row[0]:
+            decoded = base64.b64decode(row[0])
+            existing_titles, _ = extract_existing_metadata(decoded)
+    except Exception:
+        pass
+    finally:
+        if meta_conn:
+            try:
+                meta_conn.close()
+            except Exception:
+                pass
+
+    items = {}
+
+    # Scan conversations directory
+    if os.path.exists(convs_dir):
+        for f in os.listdir(convs_dir):
+            uuid = f.split('.')[0]
+            # Simple check for standard UUID length (36 chars)
+            if uuid and len(uuid) == 36:
+                items.setdefault(uuid, {
+                    "db_pb_size": 0,
+                    "brain_size": 0,
+                    "media_size": 0,
+                    "log_size": 0,
+                    "other_size": 0,
+                    "conv_files": [],
+                    "title": "",
+                    "mtime": 0.0
+                })
+                filepath = os.path.join(convs_dir, f)
+                try:
+                    items[uuid]["db_pb_size"] += os.path.getsize(filepath)
+                    items[uuid]["conv_files"].append(f)
+                    items[uuid]["mtime"] = max(items[uuid]["mtime"], os.path.getmtime(filepath))
+                except OSError:
+                    pass
+
+    # Scan brain directory
+    if os.path.exists(brain_dir):
+        for d in os.listdir(brain_dir):
+            if os.path.isdir(os.path.join(brain_dir, d)) and len(d) == 36:
+                items.setdefault(d, {
+                    "db_pb_size": 0,
+                    "brain_size": 0,
+                    "media_size": 0,
+                    "log_size": 0,
+                    "other_size": 0,
+                    "conv_files": [],
+                    "title": "",
+                    "mtime": 0.0
+                })
+                # Walk the brain folder for this UUID
+                for root, _, files in os.walk(os.path.join(brain_dir, d)):
+                    for f in files:
+                        filepath = os.path.join(root, f)
+                        try:
+                            sz = os.path.getsize(filepath)
+                            items[d]["brain_size"] += sz
+                            items[d]["mtime"] = max(items[d]["mtime"], os.path.getmtime(filepath))
+
+                            ext = os.path.splitext(f)[1].lower()
+                            if ext in ['.webp', '.png', '.jpg', '.jpeg', '.gif', '.mp4', '.webm', '.avi']:
+                                items[d]["media_size"] += sz
+                            elif ext in ['.jsonl', '.log', '.txt']:
+                                items[d]["log_size"] += sz
+                            else:
+                                items[d]["other_size"] += sz
+                        except OSError:
+                            pass
+
+    # Resolve titles and filter out empty or inactive items
+    final_items = {}
+    for uuid, data in items.items():
+        total = data["db_pb_size"] + data["brain_size"]
+        if total > 0:
+            title, _ = resolve_title(uuid, existing_titles, brain_dir, convs_dir)
+            data["title"] = title
+            final_items[uuid] = data
+
+    return final_items
+
+
+def purge_conversation_data(db_path: str, convs_dir: str, brain_dir: str, conv_uuid: str) -> bool:
+    """
+    Safely removes a single conversation from the SQLite database indices,
+    deletes its database/protobuf files from conversations directory, and
+    recursively deletes its folder in the brain directory.
+    """
+    # 1. Update database indices first
+    db_success = delete_conversation(db_path, conv_uuid)
+
+    # 2. Clean up files in conversations/ (including -wal and -shm files)
+    file_success = True
+    if os.path.exists(convs_dir):
+        for f in os.listdir(convs_dir):
+            if f.startswith(conv_uuid):
+                try:
+                    os.remove(os.path.join(convs_dir, f))
+                except OSError:
+                    file_success = False
+
+    # 3. Clean up folder in brain/
+    brain_folder = os.path.join(brain_dir, conv_uuid)
+    if os.path.exists(brain_folder):
+        try:
+            shutil.rmtree(brain_folder)
+        except OSError:
+            file_success = False
+
+    return db_success and file_success
+
+
+def prune_conversation_artifacts(brain_dir: str, conv_uuid: str, media_only: bool = True, logs_only: bool = False, scratch_only: bool = False) -> int:
+    """
+    Selectively deletes files in a conversation's brain folder to save space.
+    Returns the number of bytes saved.
+    """
+    brain_folder = os.path.join(brain_dir, conv_uuid)
+    if not os.path.exists(brain_folder):
+        return 0
+
+    bytes_saved = 0
+    # Walk bottom-up so we can safely delete folders after they are emptied
+    for root, dirs, files in os.walk(brain_folder, topdown=False):
+        for f in files:
+            filepath = os.path.join(root, f)
+            ext = os.path.splitext(f)[1].lower()
+            rel_path = os.path.relpath(filepath, brain_folder)
+
+            should_delete = False
+            if media_only and ext in ['.webp', '.png', '.jpg', '.jpeg', '.gif', '.mp4', '.webm', '.avi']:
+                should_delete = True
+            elif logs_only and ext in ['.jsonl', '.log', '.txt'] and not f.endswith('overview.txt'):
+                should_delete = True
+            elif scratch_only and 'scratch/' in rel_path.replace('\\', '/'):
+                should_delete = True
+            elif not media_only and not logs_only and not scratch_only:
+                # Deleting all non-essential files (except planning templates and overview logs)
+                if f not in TITLE_ARTIFACT_FILES and not f.endswith('overview.txt'):
+                    should_delete = True
+
+            if should_delete:
+                try:
+                    sz = os.path.getsize(filepath)
+                    os.remove(filepath)
+                    bytes_saved += sz
+                except OSError:
+                    pass
+
+        # Try to delete empty directories
+        for d in dirs:
+            dirpath = os.path.join(root, d)
+            try:
+                if not os.listdir(dirpath):
+                    os.rmdir(dirpath)
+            except OSError:
+                pass
+
+    return bytes_saved
+

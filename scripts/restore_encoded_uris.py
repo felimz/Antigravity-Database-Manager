@@ -48,29 +48,31 @@ from src.core.environment import EnvironmentResolver
 # Shared URI Normalization Helpers
 # =============================================================================
 
-def normalize_uri_to_raw(val):
-    """Normalize a single string value: replace file:///X%3A or file:///X: with file:///x:."""
+def normalize_uri_to_encoded(val):
+    """Normalize a single string value: replace file:///X: or file:///X/ with file:///x%3A."""
     if isinstance(val, str) and val.startswith("file:///"):
-        # Replace percent-encoded colon with raw colon
-        val = re.sub(r'^(file:///)([a-zA-Z])%3[Aa](/)', r'\1\2:\3', val)
+        # Restore stripped colons first (e.g. file:///c/Users/... -> file:///c%3A/Users/...)
+        val = re.sub(r'^(file:///)([a-zA-Z])(/)', r'\1\2%3A\3', val)
+        # Replace raw colon with percent-encoded colon
+        val = re.sub(r'^(file:///)([a-zA-Z]):(/)', r'\1\2%3A\3', val)
         # Force lowercase drive letter
-        val = re.sub(r'^(file:///)([a-zA-Z]):(/)', lambda m: m.group(1) + m.group(2).lower() + m.group(3), val)
+        val = re.sub(r'^(file:///)([a-zA-Z])%3[Aa](/)', lambda m: m.group(1) + m.group(2).lower() + "%3A" + m.group(3), val)
     return val
 
 
-def normalize_obj_to_raw(obj):
-    """Recursively normalize all strings in a JSON-like object to use raw colons."""
+def normalize_obj_to_encoded(obj):
+    """Recursively normalize all strings in a JSON-like object to use percent-encoded colons."""
     if isinstance(obj, dict):
         new_dict = {}
         for k, v in obj.items():
-            new_key = normalize_uri_to_raw(k)
-            new_val = normalize_obj_to_raw(v)
+            new_key = normalize_uri_to_encoded(k)
+            new_val = normalize_obj_to_encoded(v)
             new_dict[new_key] = new_val
         return new_dict
     elif isinstance(obj, list):
-        return [normalize_obj_to_raw(x) for x in obj]
+        return [normalize_obj_to_encoded(x) for x in obj]
     elif isinstance(obj, str):
-        return normalize_uri_to_raw(obj)
+        return normalize_uri_to_encoded(obj)
     return obj
 
 
@@ -121,11 +123,11 @@ def patch_storage_json(storage_path):
     with open(storage_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    normalized_data = normalize_obj_to_raw(data)
+    normalized_data = normalize_obj_to_encoded(data)
 
     with open(storage_path, "w", encoding="utf-8") as f:
         json.dump(normalized_data, f, indent=2, ensure_ascii=False)
-    print("Successfully normalized storage.json workspace paths to raw colons.")
+    print("Successfully normalized storage.json workspace paths to %3A.")
 
 
 def patch_workspace_storage(workspace_storage_dir):
@@ -142,29 +144,142 @@ def patch_workspace_storage(workspace_storage_dir):
                 with open(ws_json, "r", encoding="utf-8") as f:
                     wdata = json.load(f)
 
-                normalized_wdata = normalize_obj_to_raw(wdata)
+                normalized_wdata = normalize_obj_to_encoded(wdata)
 
                 if wdata != normalized_wdata:
-                    shutil.copy2(ws_json, ws_json + ".backup")
-                    with open(ws_json, "w", encoding="utf-8") as f:
-                        json.dump(normalized_wdata, f, indent=2, ensure_ascii=False)
-                    patched_count += 1
+                     shutil.copy2(ws_json, ws_json + ".backup")
+                     with open(ws_json, "w", encoding="utf-8") as f:
+                         json.dump(normalized_wdata, f, indent=2, ensure_ascii=False)
+                     patched_count += 1
             except Exception as e:
                 print(f"Error patching {ws_json}: {e}")
 
-    print(f"Normalized {patched_count} workspace.json files in workspaceStorage to raw colons.")
+    print(f"Normalized {patched_count} workspace.json files in workspaceStorage to %3A.")
 
 
 def patch_workbench_js():
-    """No-op: workbench JS patching is no longer needed since we use raw colons."""
-    print("Skipping JS patch (IDE natively supports raw colons in-memory).")
-    return
+    """Patch workbench.desktop.main.js to normalize URIs at deserialization time."""
+    js_path = os.path.join(
+        os.environ.get("LOCALAPPDATA", ""),
+        "Programs", "Antigravity IDE", "resources", "app", "out",
+        "vs", "workbench", "workbench.desktop.main.js"
+    )
+    if not os.path.exists(js_path):
+        print(f"[WARNING] workbench.desktop.main.js not found at {js_path}. Skipping JS patch.")
+        return
+
+    backup_path = js_path + ".bak"
+    if not os.path.exists(backup_path):
+        print(f"Creating backup of workbench.desktop.main.js at: {backup_path}")
+        try:
+            shutil.copy2(js_path, backup_path)
+        except Exception as e:
+            print(f"[ERROR] Failed to create JS backup: {e}")
+            return
+    else:
+        print(f"JS Backup already exists at: {backup_path}")
+
+    print("Reading and patching workbench.desktop.main.js...")
+    try:
+        with open(js_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+
+        # We support multiple minified signatures across different IDE versions
+        signatures = [
+            # Current version: function DC(t,e){return BPt(e,sLu(t))}
+            {
+                "target": "function DC(t,e){return BPt(e,sLu(t))}",
+                "replacement": (
+                    'function DC(t,e){const res=BPt(e,sLu(t));if(res&&Array.isArray(res.workspaces))'
+                    '{for(const w of res.workspaces){if(w&&typeof w.workspaceFolderAbsoluteUri==="string")'
+                    '{w.workspaceFolderAbsoluteUri=w.workspaceFolderAbsoluteUri.replace('
+                    '/file:\\/\\/\\/([a-zA-Z]):/g,"file:///$1%3A")}if(w&&typeof w.gitRootAbsoluteUri==="string")'
+                    '{w.gitRootAbsoluteUri=w.gitRootAbsoluteUri.replace('
+                    '/file:\\/\\/\\/([a-zA-Z]):/g,"file:///$1%3A")}}}return res}'
+                )
+            },
+            # Previous version: function hR(t,e){return yOt(e,Bku(t))}
+            {
+                "target": "function hR(t,e){return yOt(e,Bku(t))}",
+                "replacement": (
+                    'function hR(t,e){const res=yOt(e,Bku(t));if(res&&Array.isArray(res.workspaces))'
+                    '{for(const w of res.workspaces){if(w&&typeof w.workspaceFolderAbsoluteUri==="string")'
+                    '{w.workspaceFolderAbsoluteUri=w.workspaceFolderAbsoluteUri.replace('
+                    '/file:\\/\\/\\/([a-zA-Z]):/g,"file:///$1%3A")}if(w&&typeof w.gitRootAbsoluteUri==="string")'
+                    '{w.gitRootAbsoluteUri=w.gitRootAbsoluteUri.replace('
+                    '/file:\\/\\/\\/([a-zA-Z]):/g,"file:///$1%3A")}}}return res}'
+                )
+            }
+        ]
+
+        patched = False
+        for sig in signatures:
+            if sig["target"] in content:
+                content = content.replace(sig["target"], sig["replacement"])
+                with open(js_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                print("Successfully patched workbench.desktop.main.js for in-memory URI normalization!")
+                patched = True
+                break
+            elif sig["replacement"] in content:
+                print("workbench.desktop.main.js is already patched.")
+                patched = True
+                break
+
+        if not patched:
+            print("[WARNING] Target signature not found in workbench.desktop.main.js. Skipping JS patch.")
+    except Exception as e:
+        print(f"[ERROR] Failed to patch workbench.desktop.main.js: {e}")
 
 
 def patch_product_json_checksum():
-    """No-op: product.json patching is no longer needed since we do not modify workbench JS."""
-    print("Skipping product.json checksum update.")
-    return
+    """Recalculate the SHA-256 checksum for the patched JS file in product.json."""
+    localappdata = os.environ.get("LOCALAPPDATA", "")
+    js_path = os.path.join(
+        localappdata, "Programs", "Antigravity IDE", "resources", "app", "out",
+        "vs", "workbench", "workbench.desktop.main.js"
+    )
+    product_json_path = os.path.join(
+        localappdata, "Programs", "Antigravity IDE", "resources", "app", "product.json"
+    )
+
+    if not os.path.exists(js_path) or not os.path.exists(product_json_path):
+        print("[WARNING] Could not find JS file or product.json to update checksums.")
+        return
+
+    print("Calculating new checksum for workbench.desktop.main.js...")
+    try:
+        with open(js_path, "rb") as f:
+            data = f.read()
+        import hashlib
+        import base64
+        sha = hashlib.sha256(data).digest()
+        new_checksum = base64.b64encode(sha).decode('utf-8').rstrip('=')
+        print(f"New checksum: {new_checksum}")
+
+        product_backup = product_json_path + ".bak"
+        if not os.path.exists(product_backup):
+            print(f"Backing up product.json to {product_backup}...")
+            shutil.copy2(product_json_path, product_backup)
+        else:
+            print(f"product.json backup already exists at: {product_backup}")
+
+        with open(product_json_path, "r", encoding="utf-8") as f:
+            pdata = json.load(f)
+
+        if "checksums" in pdata:
+            key = "vs/workbench/workbench.desktop.main.js"
+            old_checksum = pdata["checksums"].get(key)
+            print(f"Updating checksum key '{key}' from {old_checksum} to {new_checksum}...")
+            pdata["checksums"][key] = new_checksum
+
+            with open(product_json_path, "w", encoding="utf-8") as f:
+                json.dump(pdata, f, indent=2, ensure_ascii=False)
+            print("Successfully updated product.json with the new checksum!")
+        else:
+            print("[WARNING] 'checksums' key not found in product.json.")
+    except Exception as e:
+        print(f"[ERROR] Failed to update product.json checksum: {e}")
 
 
 
@@ -272,10 +387,12 @@ def process_protobuf_message(data):
         try:
             text = data.decode('utf-8')
             if "file:///" in text:
-                # Replace percent-encoded colon with raw colon
-                new_text = re.sub(r'file:///([a-zA-Z])%3[Aa]', r'file:///\1:', text)
+                # Restore stripped colons first (e.g. file:///c/ -> file:///c%3A/)
+                new_text = re.sub(r'file:///([a-zA-Z])/', r'file:///\1%3A/', text)
+                # Replace raw colon with percent-encoded colon
+                new_text = re.sub(r'file:///([a-zA-Z]):', r'file:///\1%3A', new_text)
                 # Lowercase drive letters
-                new_text = re.sub(r'file:///([a-zA-Z]):', lambda m: f"file:///{m.group(1).lower()}:", new_text)
+                new_text = re.sub(r'file:///([a-zA-Z])%3[Aa]', lambda m: f"file:///{m.group(1).lower()}%3A", new_text)
                 if new_text != text:
                     print(f"    Normalizing URI: {text[:80]}")
                     print(f"                  -> {new_text[:80]}")
@@ -318,8 +435,8 @@ def patch_standalone_conversation_dbs(convs_dir):
 
             raw_data = row[0]
 
-            if b"file:///" not in raw_data or not re.search(rb'file:///[a-zA-Z]:/', raw_data):
-                print(f"  [OK]   {f}: No raw-colon URIs")
+            if b"file:///" not in raw_data or not (re.search(rb'file:///[a-zA-Z]:/', raw_data) or re.search(rb'file:///[A-Z]%3[Aa]/', raw_data)):
+                print(f"  [OK]   {f}: No raw-colon or uppercase URIs")
                 conn.close()
                 continue
 
@@ -375,8 +492,8 @@ def patch_standalone_summaries(pb_path):
 
         print(f"  File size: {len(raw_data)} bytes")
 
-        if not re.search(rb'file:///[a-zA-Z]:/', raw_data):
-            print("  [OK] No raw-colon URIs found")
+        if b"file:///" not in raw_data or not (re.search(rb'file:///[a-zA-Z]:/', raw_data) or re.search(rb'file:///[A-Z]%3[Aa]/', raw_data)):
+            print("  [OK] No raw-colon or uppercase URIs found")
             return False
 
         backup_path = pb_path + ".bak_uri_repair"
@@ -405,15 +522,17 @@ def patch_standalone_summaries(pb_path):
 
 
 def verify_standalone_results(convs_dir, pb_path):
-    """Post-repair verification: ensure no raw-colon URIs remain in standalone app files."""
+    """Post-repair verification: ensure no raw-colon, uppercase, or missing-colon URIs remain in standalone app files."""
     print("\n  Post-repair verification:")
     all_clean = True
 
     if os.path.exists(pb_path):
         data = open(pb_path, "rb").read()
         raw_hits = re.findall(rb'file:///[a-zA-Z]:/', data)
-        if raw_hits:
-            print(f"  [FAIL] Summaries PB still has {len(raw_hits)} raw-colon URI(s)")
+        uppercase_hits = re.findall(rb'file:///[A-Z]%3[Aa]/', data)
+        missing_colon_hits = re.findall(rb'file:///[a-zA-Z]/', data)
+        if raw_hits or uppercase_hits or missing_colon_hits:
+            print(f"  [FAIL] Summaries PB still has {len(raw_hits)} raw-colon, {len(uppercase_hits)} uppercase, and {len(missing_colon_hits)} missing-colon URI(s)")
             all_clean = False
         else:
             print(f"  [PASS] Summaries PB: all URIs normalized")
@@ -437,8 +556,10 @@ def verify_standalone_results(convs_dir, pb_path):
                 conn.close()
                 if row and row[0]:
                     raw_hits = re.findall(rb'file:///[a-zA-Z]:/', row[0])
-                    if raw_hits:
-                        print(f"  [FAIL] {f}: {len(raw_hits)} raw-colon URI(s) remain")
+                    uppercase_hits = re.findall(rb'file:///[A-Z]%3[Aa]/', row[0])
+                    missing_colon_hits = re.findall(rb'file:///[a-zA-Z]/', row[0])
+                    if raw_hits or uppercase_hits or missing_colon_hits:
+                        print(f"  [FAIL] {f}: {len(raw_hits)} raw-colon, {len(uppercase_hits)} uppercase, and {len(missing_colon_hits)} missing-colon URI(s) remain")
                         all_clean = False
                     else:
                         print(f"  [PASS] {f}: clean")
@@ -449,7 +570,7 @@ def verify_standalone_results(convs_dir, pb_path):
     if all_clean:
         print("  ALL FILES VERIFIED CLEAN")
     else:
-        print("  SOME FILES STILL CONTAIN RAW-COLON URIs")
+        print("  SOME FILES STILL CONTAIN INVALID URIs")
 
     return all_clean
 

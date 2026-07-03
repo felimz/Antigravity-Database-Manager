@@ -481,3 +481,252 @@ def _pause() -> None:
         input("  Press Enter to continue...")
     except (KeyboardInterrupt, EOFError):
         pass
+
+
+def run_prune_interactive(ctx: ApplicationContext, report: dict[str, dict[str, Any]]) -> None:
+    """Interactive CLI menu for selecting and deleting conversations or artifacts."""
+    while True:
+        # Re-calculate total sizes
+        total_db_pb = sum(item["db_pb_size"] for item in report.values())
+        total_brain = sum(item["brain_size"] for item in report.values())
+        total_cache = total_db_pb + total_brain
+
+        Logger.header("Cache Pruning Hub")
+        print(f"  Total Cache Size: {total_cache / (1024 * 1024):.2f} MB")
+        print(f"    - Conversations DB/PB: {total_db_pb / (1024 * 1024):.2f} MB")
+        print(f"    - Brain Artifacts:     {total_brain / (1024 * 1024):.2f} MB")
+        print()
+        print("  Options:")
+        print("    [1] Delete Entire Conversations (Select multiple to delete)")
+        print("    [2] Prune Large Brain Artifacts (Select visual media/logs/scratch)")
+        print("    [3] Auto-Prune cache down to under 500MB (Proposed plan first)")
+        print("    [Enter] Back")
+        print("=" * 60)
+
+        try:
+            choice = input("  Select option: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            break
+
+        if not choice:
+            break
+
+        if choice == "1":
+            # List largest conversations
+            sorted_convs = sorted(report.items(), key=lambda x: x[1]["db_pb_size"] + x[1]["brain_size"], reverse=True)
+            Logger.header("Delete Entire Conversations")
+            print("  Top 15 Largest Conversations:")
+            print(f"    {'#':>2} | {'UUID Prefix':<11} | {'Total Size':<10} | {'Title':<45}")
+            print("-" * 80)
+            for idx, (uuid, item) in enumerate(sorted_convs[:15]):
+                sz = (item["db_pb_size"] + item["brain_size"]) / (1024 * 1024)
+                print(f"    {idx+1:>2} | {uuid[:11]} | {sz:>7.2f} MB | {item['title'][:45]}")
+            print()
+
+            try:
+                indices_str = input("  Enter indices to delete (comma-separated, e.g., 1,3,5 or [Enter] Cancel): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                continue
+
+            if not indices_str:
+                continue
+
+            # Parse indices
+            to_delete = []
+            for item in indices_str.split(","):
+                try:
+                    i = int(item.strip()) - 1
+                    if 0 <= i < len(sorted_convs):
+                        to_delete.append(sorted_convs[i])
+                except ValueError:
+                    pass
+
+            if not to_delete:
+                Logger.info("No valid indices selected.")
+                _pause()
+                continue
+
+            print("\nThe following conversations will be DELETED ENTIRELY:")
+            for uuid, item in to_delete:
+                sz = (item["db_pb_size"] + item["brain_size"]) / (1024 * 1024)
+                print(f"  - {uuid} | {sz:.2f} MB | {item['title']}")
+
+            try:
+                confirm = input("\nAre you sure you want to permanently delete these? (y/N): ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                confirm = "n"
+
+            if confirm == "y":
+                saved_bytes = 0
+                success_count = 0
+                for uuid, item in to_delete:
+                    sz = item["db_pb_size"] + item["brain_size"]
+                    if ops.purge_conversation_data(ctx.db_path, ctx.convs_dir, ctx.brain_dir, uuid):
+                        Logger.success(f"Purged: {item['title'][:50]}")
+                        success_count += 1
+                        saved_bytes += sz
+                        del report[uuid]
+                    else:
+                        Logger.error(f"Failed to purge: {uuid}")
+                Logger.success(f"\nPurged {success_count} conversations. Freed {saved_bytes / (1024*1024):.2f} MB.")
+                _pause()
+
+        elif choice == "2":
+            # List largest brain directories
+            sorted_brains = sorted(
+                [x for x in report.items() if x[1]["brain_size"] > 0],
+                key=lambda x: x[1]["brain_size"],
+                reverse=True
+            )
+            Logger.header("Prune Large Brain Artifacts")
+            print("  Top 15 Largest Brain Folders:")
+            print(f"    {'#':>2} | {'UUID Prefix':<11} | {'Brain Size':<10} | {'Media Size':<10} | {'Logs Size':<9} | {'Title'}")
+            print("-" * 90)
+            for idx, (uuid, item) in enumerate(sorted_brains[:15]):
+                br_sz = item["brain_size"] / (1024 * 1024)
+                m_sz = item["media_size"] / (1024 * 1024)
+                l_sz = item["log_size"] / (1024 * 1024)
+                print(f"    {idx+1:>2} | {uuid[:11]} | {br_sz:>7.2f} MB | {m_sz:>7.2f} MB | {l_sz:>6.2f} MB | {item['title'][:40]}")
+            print()
+
+            try:
+                index_str = input("  Enter index to prune (or [Enter] Cancel): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                continue
+
+            if not index_str:
+                continue
+
+            try:
+                i = int(index_str) - 1
+                if not (0 <= i < len(sorted_brains)):
+                    Logger.error("Invalid index.")
+                    _pause()
+                    continue
+            except ValueError:
+                Logger.error("Invalid input.")
+                _pause()
+                continue
+
+            target_uuid, target_item = sorted_brains[i]
+            print(f"\nSelected: {target_item['title']}")
+            print("  Pruning options:")
+            print("    [1] Prune Media only (webp, png, mp4, etc.)")
+            print("    [2] Prune Logs only (jsonl, log, txt)")
+            print("    [3] Prune Scratch directory only")
+            print("    [4] Prune All non-essential artifacts (keep plan markdowns)")
+            print("    [Enter] Cancel")
+
+            try:
+                prune_choice = input("  Select prune type: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                continue
+
+            if prune_choice not in ["1", "2", "3", "4"]:
+                continue
+
+            media = prune_choice == "1"
+            logs = prune_choice == "2"
+            scratch = prune_choice == "3"
+            all_non_essential = prune_choice == "4"
+
+            confirm = input("  Confirm pruning? (y/N): ").strip().lower()
+            if confirm == "y":
+                if all_non_essential:
+                    saved = ops.prune_conversation_artifacts(ctx.brain_dir, target_uuid, media_only=False, logs_only=False, scratch_only=False)
+                else:
+                    saved = ops.prune_conversation_artifacts(ctx.brain_dir, target_uuid, media_only=media, logs_only=logs, scratch_only=scratch)
+
+                Logger.success(f"Pruned successfully. Saved {saved / (1024 * 1024):.2f} MB.")
+                # Refresh report metrics for this item
+                report = ops.get_cache_size_report(ctx.db_path, ctx.convs_dir, ctx.brain_dir)
+                _pause()
+
+        elif choice == "3":
+            # Auto-prune to under 500MB
+            target_mb = 500
+            target_bytes = target_mb * 1024 * 1024
+            if total_cache <= target_bytes:
+                Logger.success(f"Cache is already under target size of {target_mb} MB.")
+                _pause()
+                continue
+
+            bytes_to_free = total_cache - target_bytes
+            Logger.header(f"Auto-Pruning down to {target_mb} MB")
+            print(f"  Current cache size:  {total_cache / (1024 * 1024):.2f} MB")
+            print(f"  Target cache size:   {target_mb:.2f} MB")
+            print(f"  Required savings:    {bytes_to_free / (1024 * 1024):.2f} MB")
+            print()
+
+            # By default, we prune media first across all conversations
+            to_delete_entire = set()
+            to_prune_artifacts = {}
+            saved_so_far = 0
+
+            # 1. Prune all media
+            for u in report:
+                media_sz = report[u]["media_size"]
+                if media_sz > 0:
+                    to_prune_artifacts[u] = {"media_only": True}
+                    saved_so_far += media_sz
+
+            # 2. Delete oldest conversations if needed
+            if total_cache - saved_so_far > target_bytes:
+                sorted_by_age = sorted(report.items(), key=lambda x: x[1]["mtime"])
+                for u, item in sorted_by_age:
+                    if total_cache - saved_so_far <= target_bytes:
+                        break
+                    if u in to_prune_artifacts:
+                        del to_prune_artifacts[u]
+                    to_delete_entire.add(u)
+                    saved_so_far += (item["db_pb_size"] + item["brain_size"])
+
+            # Print proposal
+            if to_delete_entire:
+                print("Conversations proposed for DELETION ENTIRELY:")
+                for u in to_delete_entire:
+                    item = report[u]
+                    sz = (item["db_pb_size"] + item["brain_size"]) / (1024 * 1024)
+                    print(f"  - {u} | {sz:.2f} MB | {item['title']}")
+                print()
+
+            if to_prune_artifacts:
+                print("Conversations proposed for MEDIA ARTIFACT PRUNING:")
+                for u in to_prune_artifacts:
+                    item = report[u]
+                    print(f"  - {u} | {item['media_size'] / (1024*1024):.2f} MB | {item['title']}")
+                print()
+
+            print(f"Total proposed savings: {saved_so_far / (1024*1024):.2f} MB")
+            try:
+                confirm = input("\nProceed with auto-pruning? (y/N): ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                confirm = "n"
+
+            if confirm == "y":
+                actual_saved = 0
+                deleted_count = 0
+                pruned_count = 0
+
+                for u in to_delete_entire:
+                    item = report[u]
+                    total_sz = item["db_pb_size"] + item["brain_size"]
+                    if ops.purge_conversation_data(ctx.db_path, ctx.convs_dir, ctx.brain_dir, u):
+                        deleted_count += 1
+                        actual_saved += total_sz
+                        del report[u]
+
+                for u in to_prune_artifacts:
+                    saved = ops.prune_conversation_artifacts(ctx.brain_dir, u, media_only=True)
+                    if saved > 0:
+                        pruned_count += 1
+                        actual_saved += saved
+
+                # Refresh report metrics
+                report = ops.get_cache_size_report(ctx.db_path, ctx.convs_dir, ctx.brain_dir)
+                Logger.success(f"\nAuto-pruning complete! Freed {actual_saved / (1024 * 1024):.2f} MB.")
+                print(f"  - Conversations deleted: {deleted_count}")
+                print(f"  - Conversations pruned:  {pruned_count}")
+                _pause()
+
