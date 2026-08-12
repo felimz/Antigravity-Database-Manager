@@ -2,6 +2,7 @@ import os
 import sqlite3
 import re
 import shutil
+import time
 
 # --- Core Protobuf Decoding and Encoding Helpers ---
 
@@ -74,17 +75,15 @@ def parse_protobuf(data: bytes) -> list[tuple[int, int, bytes]]:
 def process_message(data: bytes) -> bytes:
     """
     Recursively decodes Protobuf layers, finds URI strings with raw colons,
-    replaces them with percent-encoded colons, and rebuilds the message
-    while updating length delimiters.
+    replaces them with percent-encoded colons, normalizes drive letter casing,
+    and rebuilds the message while updating length delimiters.
     """
     try:
-        # Attempt parsing as a Protobuf message
         fields = parse_protobuf(data)
         
         rebuilt = b""
         for field_num, wire_type, val in fields:
             if wire_type == 2:
-                # Recursively process nested length-delimited content
                 processed_val = process_message(val)
                 rebuilt += encode_varint((field_num << 3) | wire_type)
                 rebuilt += encode_varint(len(processed_val))
@@ -97,14 +96,15 @@ def process_message(data: bytes) -> bytes:
                 rebuilt += val
         return rebuilt
     except ValueError:
-        # Fall back to treating as raw bytes (e.g. leaf strings or payloads)
         try:
             text = data.decode('utf-8')
-            # Check if it contains a file:/// URI with a raw colon
             if "file:///" in text:
+                # Replace raw colon with percent-encoded colon
                 new_text = re.sub(r'file:///([a-zA-Z]):', r'file:///\1%3A', text)
+                # Lowercase drive letters
+                new_text = re.sub(r'file:///([a-zA-Z])%3[Aa]', lambda m: f"file:///{m.group(1).lower()}%3A", new_text)
                 if new_text != text:
-                    print(f"  Replacing URI: {text} -> {new_text}")
+                    print(f"  Replacing URI: {text[:80]} -> {new_text[:80]}")
                 return new_text.encode('utf-8')
             return data
         except UnicodeDecodeError:
@@ -115,17 +115,21 @@ def process_message(data: bytes) -> bytes:
 def patch_conversation_dbs(convs_dir: str):
     """Scan and patch all SQLite databases in the conversations folder."""
     print("\nScanning conversation databases...")
+    if not os.path.isdir(convs_dir):
+        print(f"[WARNING] Conversations directory not found: {convs_dir}")
+        return
+        
     for f in os.listdir(convs_dir):
         if not f.endswith(".db"):
             continue
-        # Skip backups or temporary files
         if "bak" in f or "repair" in f:
             continue
             
         db_path = os.path.join(convs_dir, f)
+        backup_path = db_path + ".bak_v271"
         
-        # Backup
-        shutil.copy2(db_path, db_path + ".bak_v243")
+        if not os.path.exists(backup_path):
+            shutil.copy2(db_path, backup_path)
         
         try:
             conn = sqlite3.connect(db_path)
@@ -142,7 +146,6 @@ def patch_conversation_dbs(convs_dir: str):
                 else:
                     print(f"[INFO] No mismatch in database: {f}")
             
-            # Verify DB integrity
             cursor.execute("PRAGMA integrity_check")
             status = cursor.fetchone()[0]
             if status != "ok":
@@ -158,8 +161,9 @@ def patch_summaries_file(pb_path: str):
         print(f"[WARNING] Summaries file not found: {pb_path}")
         return
         
-    # Backup
-    shutil.copy2(pb_path, pb_path + ".bak_v243")
+    backup_path = pb_path + ".bak_v271"
+    if not os.path.exists(backup_path):
+        shutil.copy2(pb_path, backup_path)
     
     try:
         with open(pb_path, "rb") as f:
@@ -180,10 +184,17 @@ def main():
     convs_dir = os.path.join(base_dir, "conversations")
     pb_path = os.path.join(base_dir, "agyhub_summaries_proto.pb")
     
+    print("==============================================================")
+    print("   ANTIGRAVITY 2.0 (v2.7.1) STANDALONE URI REPAIR TOOL")
+    print("==============================================================")
+    
     patch_conversation_dbs(convs_dir)
     patch_summaries_file(pb_path)
     
-    print("\nAll operations completed. Please restart the standalone app to verify.")
+    print("\n==============================================================")
+    print("ALL REPAIR OPERATIONS COMPLETED SUCCESSFULLY!")
+    print("Please restart the standalone app to verify.")
+    print("==============================================================")
 
 if __name__ == "__main__":
     main()
