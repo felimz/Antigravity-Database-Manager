@@ -126,7 +126,7 @@ def patch_conversation_dbs(convs_dir: str):
             continue
             
         db_path = os.path.join(convs_dir, f)
-        backup_path = db_path + ".bak_v271"
+        backup_path = db_path + ".bak_v281"
         
         if not os.path.exists(backup_path):
             shutil.copy2(db_path, backup_path)
@@ -161,7 +161,7 @@ def patch_summaries_file(pb_path: str):
         print(f"[WARNING] Summaries file not found: {pb_path}")
         return
         
-    backup_path = pb_path + ".bak_v271"
+    backup_path = pb_path + ".bak_v281"
     if not os.path.exists(backup_path):
         shutil.copy2(pb_path, backup_path)
     
@@ -185,7 +185,7 @@ def main():
     pb_path = os.path.join(base_dir, "agyhub_summaries_proto.pb")
     
     print("==============================================================")
-    print("   ANTIGRAVITY 2.0 (v2.7.1) STANDALONE URI REPAIR TOOL")
+    print("   ANTIGRAVITY 2.0 (v2.8.1) STANDALONE URI REPAIR TOOL")
     print("==============================================================")
     
     patch_conversation_dbs(convs_dir)
